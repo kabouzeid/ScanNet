@@ -30,11 +30,12 @@ import math
 import os, sys, argparse
 import inspect
 from copy import deepcopy
+from uuid import uuid4
 
 try:
     import numpy as np
 except:
-    print "Failed to import numpy package."
+    print("Failed to import numpy package.")
     sys.exit(-1)
 
 currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
@@ -44,13 +45,12 @@ import util
 import util_3d
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--pred_path', required=True, help='path to directory of predicted .txt files')
 parser.add_argument('--gt_path', required=True, help='path to directory of gt .txt files')
-parser.add_argument('--output_file', default='', help='output file [default: pred_path/semantic_instance_evaluation.txt]')
+parser.add_argument('--output_file', default='', help='output file [default: ./semantic_instance_evaluation.txt]')
 opt = parser.parse_args()
 
 if opt.output_file == '':
-    opt.output_file = os.path.join(opt.pred_path, 'semantic_instance_evaluation.txt')
+    opt.output_file = os.path.join(os.getcwd(), 'semantic_instance_evaluation.txt')
 
 
 # ---------- Label info ---------- #
@@ -79,7 +79,7 @@ def evaluate_matches(matches):
     dist_confs = [ opt.distance_confs[0] ]
     
     # results: class x overlap
-    ap = np.zeros( (len(dist_threshes) , len(CLASS_LABELS) , len(overlaps)) , np.float )
+    ap = np.zeros( (len(dist_threshes) , len(CLASS_LABELS) , len(overlaps)) , float )
     for di, (min_region_size, distance_thresh, distance_conf) in enumerate(zip(min_region_sizes, dist_threshes, dist_confs)):
         for oi, overlap_th in enumerate(overlaps):
             pred_visited = {}
@@ -87,8 +87,8 @@ def evaluate_matches(matches):
                 for p in matches[m]['pred']:
                     for label_name in CLASS_LABELS:
                         for p in matches[m]['pred'][label_name]:
-                            if 'filename' in p:
-                                pred_visited[p['filename']] = False
+                            if 'uuid' in p:
+                                pred_visited[p['uuid']] = False
             for li, label_name in enumerate(CLASS_LABELS):
                 y_true = np.empty(0)
                 y_score = np.empty(0)
@@ -107,14 +107,14 @@ def evaluate_matches(matches):
 
                     cur_true  = np.ones ( len(gt_instances) )
                     cur_score = np.ones ( len(gt_instances) ) * (-float("inf"))
-                    cur_match = np.zeros( len(gt_instances) , dtype=np.bool )
+                    cur_match = np.zeros( len(gt_instances) , dtype=bool )
                     # collect matches
                     for (gti,gt) in enumerate(gt_instances):
                         found_match = False
                         num_pred = len(gt['matched_pred'])
                         for pred in gt['matched_pred']:
                             # greedy assignments
-                            if pred_visited[pred['filename']]:
+                            if pred_visited[pred['uuid']]:
                                 continue
                             overlap = float(pred['intersection']) / (gt['vert_count']+pred['vert_count']-pred['intersection'])
                             if overlap > overlap_th:
@@ -134,7 +134,7 @@ def evaluate_matches(matches):
                                     found_match = True
                                     cur_match[gti] = True
                                     cur_score[gti] = confidence
-                                    pred_visited[pred['filename']] = True
+                                    pred_visited[pred['uuid']] = True
                         if not found_match:
                             hard_false_negatives += 1
                     # remove non-matched ground truth instances
@@ -241,15 +241,23 @@ def compute_averages(aps):
         avg_dict["classes"][label_name]["ap25%"]    = np.average(aps[ d_inf,li,o25])
     return avg_dict
 
+def make_pred_info(pred: dict):
+    # pred = {'pred_scores' = 100, 'pred_classes' = 100 'pred_masks' = Nx100}
+    pred_info = {}
+    assert(pred['pred_classes'].shape[0] == pred['pred_scores'].shape[0] == pred['pred_masks'].shape[1])
+    for i in range(len(pred['pred_classes'])):
+        info = {}
+        info["label_id"] = pred['pred_classes'][i]
+        info["conf"] = pred['pred_scores'][i]
+        info["mask"] = pred['pred_masks'][:,i]
+        pred_info[uuid4()] = info # we later need to identify these objects
+    return pred_info
 
-def assign_instances_for_scan(pred_file, gt_file, pred_path):
-    try:
-        pred_info = util_3d.read_instance_prediction_file(pred_file, pred_path)
-    except Exception, e:
-        util.print_error('unable to load ' + pred_file + ': ' + str(e))
+def assign_instances_for_scan(pred: dict, gt_file: str):
+    pred_info = make_pred_info(pred)
     try:
         gt_ids = util_3d.load_ids(gt_file)
-    except Exception, e:
+    except Exception as e:
         util.print_error('unable to load ' + gt_file + ': ' + str(e))
 
     # get gt instances
@@ -266,16 +274,15 @@ def assign_instances_for_scan(pred_file, gt_file, pred_path):
     # mask of void labels in the groundtruth
     bool_void = np.logical_not(np.in1d(gt_ids//1000, VALID_CLASS_IDS))
     # go thru all prediction masks
-    for pred_mask_file in pred_info:
-        label_id = int(pred_info[pred_mask_file]['label_id'])
-        conf = pred_info[pred_mask_file]['conf']
+    for uuid in pred_info:
+        label_id = int(pred_info[uuid]['label_id'])
+        conf = pred_info[uuid]['conf']
         if not label_id in ID_TO_LABEL:
             continue
         label_name = ID_TO_LABEL[label_id]
         # read the mask
-        pred_mask = util_3d.load_ids(pred_mask_file)
-        if len(pred_mask) != len(gt_ids):
-            util.print_error('wrong number of lines in ' + pred_mask_file + '(%d) vs #mesh vertices (%d), please double check and/or re-download the mesh' % (len(pred_mask), len(gt_ids)))
+        pred_mask = pred_info[uuid]['mask']
+        assert(len(pred_mask) == len(gt_ids))
         # convert to binary
         pred_mask = np.not_equal(pred_mask, 0)
         num = np.count_nonzero(pred_mask)
@@ -283,7 +290,7 @@ def assign_instances_for_scan(pred_file, gt_file, pred_path):
             continue  # skip if empty
 
         pred_instance = {}
-        pred_instance['filename'] = pred_mask_file
+        pred_instance['uuid'] = uuid
         pred_instance['pred_id'] = num_pred_instances
         pred_instance['label_id'] = label_id
         pred_instance['vert_count'] = num
@@ -314,15 +321,15 @@ def print_results(avgs):
     col1    = ":"
     lineLen = 64
 
-    print ""
-    print "#"*lineLen
+    print("")
+    print("#"*lineLen)
     line  = ""
     line += "{:<15}".format("what"      ) + sep + col1
     line += "{:>15}".format("AP"        ) + sep
     line += "{:>15}".format("AP_50%"    ) + sep
     line += "{:>15}".format("AP_25%"    ) + sep
-    print line
-    print "#"*lineLen
+    print(line)
+    print("#"*lineLen)
 
     for (li,label_name) in enumerate(CLASS_LABELS):
         ap_avg  = avgs["classes"][label_name]["ap"]
@@ -332,19 +339,19 @@ def print_results(avgs):
         line += sep + "{:>15.3f}".format(ap_avg ) + sep
         line += sep + "{:>15.3f}".format(ap_50o ) + sep
         line += sep + "{:>15.3f}".format(ap_25o ) + sep
-        print line
+        print(line)
 
     all_ap_avg  = avgs["all_ap"]
     all_ap_50o  = avgs["all_ap_50%"]
     all_ap_25o  = avgs["all_ap_25%"]
 
-    print "-"*lineLen
+    print("-"*lineLen)
     line  = "{:<15}".format("average") + sep + col1 
     line += "{:>15.3f}".format(all_ap_avg)  + sep 
     line += "{:>15.3f}".format(all_ap_50o)  + sep
     line += "{:>15.3f}".format(all_ap_25o)  + sep
-    print line
-    print ""
+    print(line)
+    print("")
 
 
 def write_result_file(avgs, filename):
@@ -360,19 +367,23 @@ def write_result_file(avgs, filename):
             f.write(_SPLITTER.join([str(x) for x in [class_name, class_id, ap, ap50, ap25]]) + '\n')    
 
 
-def evaluate(pred_files, gt_files, pred_path, output_file):
-    print 'evaluating', len(pred_files), 'scans...'
+def evaluate(preds: dict, gt_path: str, output_file: str):
+    print('evaluating', len(preds), 'scans...')
     matches = {}
-    for i in range(len(pred_files)):
-        matches_key = os.path.abspath(gt_files[i])
+    for i,(k,v) in enumerate(preds.items()):
+        gt_file = os.path.join(gt_path, k + ".txt")
+        if not os.path.isfile(gt_file):
+            util.print_error('Scan {} does not match any gt file'.format(k), user_fault=True)
+
+        matches_key = os.path.abspath(gt_file)
         # assign gt to predictions
-        gt2pred, pred2gt = assign_instances_for_scan(pred_files[i], gt_files[i], pred_path)
+        gt2pred, pred2gt = assign_instances_for_scan(v, gt_file)
         matches[matches_key] = {}
         matches[matches_key]['gt'] = gt2pred
         matches[matches_key]['pred'] = pred2gt
         sys.stdout.write("\rscans processed: {}".format(i+1))
         sys.stdout.flush()
-    print ''
+    print('')
     ap_scores = evaluate_matches(matches)
     avgs = compute_averages(ap_scores)
 
@@ -380,22 +391,11 @@ def evaluate(pred_files, gt_files, pred_path, output_file):
     print_results(avgs)
     write_result_file(avgs, output_file)
 
-
+# TODO: remove this
+import pandas as pd
 def main():
-    pred_files = [f for f in os.listdir(opt.pred_path) if f.endswith('.txt') and f != 'semantic_instance_evaluation.txt']
-    gt_files = []
-    if len(pred_files) == 0:
-        util.print_error('No result files found.', user_fault=True)
-    for i in range(len(pred_files)):
-        gt_file = os.path.join(opt.gt_path, pred_files[i])
-        if not os.path.isfile(gt_file):
-            util.print_error('Result file {} does not match any gt file'.format(pred_files[i]), user_fault=True)
-        gt_files.append(gt_file)
-        pred_files[i] = os.path.join(opt.pred_path, pred_files[i])
-
-    # evaluate
-    evaluate(pred_files, gt_files, opt.pred_path, opt.output_file)
-
+    print("!!! CLI is only for debugging purposes. use `evaluate()` instead.")
+    evaluate(pd.read_pickle("/globalwork/schult/saved_predictions.pkl"), opt.gt_path, opt.output_file)
 
 if __name__ == '__main__':
     main()
